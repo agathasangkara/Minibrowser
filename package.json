@@ -1,0 +1,61 @@
+{
+  "name": "minibrowser",
+  "version": "1.0.0",
+  "description": "Minimal Chromium browser",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build:ts": "tsc",
+    "copy:html": "node -e \"const fs=require('fs'),p=require('path');const d=p.join('dist','renderer');fs.mkdirSync(d,{recursive:true});fs.copyFileSync(p.join('src','renderer','index.html'),p.join(d,'index.html'));fs.copyFileSync(p.join('src','renderer','style.css'),p.join(d,'style.css'));\"",
+    "dev": "npm run build:ts && npm run copy:html && electron .",
+    "pack": "npm run build:ts && npm run copy:html && electron-builder --win",
+    "pack:msi": "npm run build:ts && npm run copy:html && electron-builder --win --config.win.target=msi"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.0"
+  },
+  "build": {
+    "appId": "com.minibrowser.app",
+    "productName": "Minibrowser",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "assets/**/*"
+    ],
+    "protocols": [
+      { "name": "HTTP", "schemes": ["http"] },
+      { "name": "HTTPS", "schemes": ["https"] }
+    ],
+    "win": {
+      "target": ["nsis", "msi"],
+      "icon": "assets/icon.ico",
+      "fileAssociations": [
+        { "ext": "html", "name": "HTML File", "role": "Viewer" },
+        { "ext": "htm", "name": "HTM File", "role": "Viewer" }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "shortcutName": "Minibrowser",
+      "artifactName": "Minibrowser.${ext}"
+    },
+    "msi": {
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "artifactName": "Minibrowser.${ext}"
+    }
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  }
+}

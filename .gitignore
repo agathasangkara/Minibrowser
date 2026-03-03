@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+extensions/
+profiles/
+release/
+*.crx
+*.php
+*.py
+profiles.json
