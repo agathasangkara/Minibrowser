@@ -192,8 +192,6 @@ html, body {
   border: none;
   background: transparent;
   color: var(--tab-text);
-  font-family: 'Segoe MDL2';
-  font-size: 10px;
   cursor: pointer;
   transition: background 0.1s;
 }

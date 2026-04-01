@@ -197,7 +197,7 @@ function setupIPC() {
 
   ipcMain.on('window:close', (e) => {
     const w = BrowserWindow.fromWebContents(e.sender);
-    w?.close();
+    if (w) { closeDevToolsForWindow(w); w.close(); }
   });
 
   ipcMain.handle('window:isMaximized', (e) => {
@@ -431,19 +431,25 @@ function setupIPC() {
     return Array.from(windowProfiles.values());
   });
 
-  // DevTools — embedded inside window using WebContentsView
-  const devToolsState = new Map<number, { view: WebContentsView; pageWcId: number; devWidth: number }>();
+  // DevTools — keyed by pageWcId so each tab keeps its own WebContentsView.
+  // `attached` = view is currently a child of win.contentView (i.e. visible).
+  // When switching tabs we detach (removeChildView) without destroying, then reattach when switching back.
+  const devToolsState = new Map<number, { view: WebContentsView; win: BrowserWindow; devWidth: number; attached: boolean }>();
+  const activeDevToolsWcId = new Map<number, number>(); // winId → currently visible pageWcId
+
+  function destroyDevToolsForWcId(wcId: number) {
+    const state = devToolsState.get(wcId);
+    if (!state) return;
+    devToolsState.delete(wcId);
+    if (activeDevToolsWcId.get(state.win.id) === wcId) activeDevToolsWcId.delete(state.win.id);
+    try { const wc = webContents.fromId(wcId); if (wc && !wc.isDestroyed() && wc.isDevToolsOpened()) wc.closeDevTools(); } catch {}
+    if (state.attached) try { state.win.contentView.removeChildView(state.view); } catch {}
+    try { if (!state.view.webContents.isDestroyed()) state.view.webContents.close(); } catch {}
+  }
 
   function closeDevToolsForWindow(win: BrowserWindow) {
-    const state = devToolsState.get(win.id);
-    if (!state) return;
-    devToolsState.delete(win.id); // delete first to prevent re-entry
-    try {
-      const wc = webContents.fromId(state.pageWcId);
-      if (wc && !wc.isDestroyed() && wc.isDevToolsOpened()) wc.closeDevTools();
-    } catch {}
-    try { win.contentView.removeChildView(state.view); } catch {}
-    try { if (!state.view.webContents.isDestroyed()) state.view.webContents.close(); } catch {}
+    const entries = [...devToolsState.entries()].filter(([, s]) => s.win.id === win.id);
+    for (const [wcId] of entries) destroyDevToolsForWcId(wcId);
     try { win.webContents.send('devtools:state', false, 0); } catch {}
   }
 
@@ -452,11 +458,24 @@ function setupIPC() {
     const win = BrowserWindow.fromWebContents(e.sender);
     if (!pageWC || !win) return;
 
-    const existing = devToolsState.get(win.id);
+    // Toggle off if same tab's DevTools already open and visible
+    const existing = devToolsState.get(wcId);
     if (existing) {
-      const wasToggle = existing.pageWcId === wcId;
-      closeDevToolsForWindow(win);
-      if (wasToggle) return; // toggle off
+      if (existing.attached) {
+        destroyDevToolsForWcId(wcId);
+        e.sender.send('devtools:state', false, 0);
+      }
+      return;
+    }
+
+    // Detach currently visible DevTools (another tab's) — keep it alive but remove from view
+    const currentActiveWcId = activeDevToolsWcId.get(win.id);
+    if (currentActiveWcId !== undefined) {
+      const cur = devToolsState.get(currentActiveWcId);
+      if (cur && cur.attached) {
+        cur.attached = false;
+        try { win.contentView.removeChildView(cur.view); } catch {}
+      }
     }
 
     const devWidth = Math.floor(rect.w * 0.4);
@@ -467,25 +486,65 @@ function setupIPC() {
     pageWC.setDevToolsWebContents(view.webContents);
     pageWC.openDevTools();
 
-    devToolsState.set(win.id, { view, pageWcId: wcId, devWidth });
+    devToolsState.set(wcId, { view, win, devWidth, attached: true });
+    activeDevToolsWcId.set(win.id, wcId);
     e.sender.send('devtools:state', true, devWidth);
 
-    // Delayed listener for DevTools X button — avoids init race condition
+    // Delayed listener for DevTools X button — avoids init race condition.
+    // Only destroy if the view is currently attached (visible) — not if it was just hidden.
     setTimeout(() => {
-      if (pageWC.isDestroyed() || !devToolsState.has(win.id)) return;
+      if (pageWC.isDestroyed() || !devToolsState.has(wcId)) return;
       pageWC.once('devtools-closed', () => {
-        if (devToolsState.get(win.id)?.pageWcId === wcId) {
-          closeDevToolsForWindow(win);
+        const st = devToolsState.get(wcId);
+        if (st && st.attached) {
+          const wasActive = activeDevToolsWcId.get(win.id) === wcId;
+          destroyDevToolsForWcId(wcId);
+          if (wasActive) try { win.webContents.send('devtools:state', false, 0); } catch {}
         }
       });
     }, 3000);
+  });
+
+  // Called when user switches tabs — detach old DevTools view, reattach new one (no destroy).
+  ipcMain.on('devtools:switch', (e, oldWcId: number | null, newWcId: number | null, rect: { x: number; y: number; w: number; h: number }) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+
+    // Detach old tab's DevTools (remove from view hierarchy, keep state alive)
+    if (oldWcId !== null && oldWcId !== 0) {
+      const old = devToolsState.get(oldWcId);
+      if (old && old.attached) {
+        old.attached = false;
+        try { win.contentView.removeChildView(old.view); } catch {}
+      }
+    }
+
+    // Reattach new tab's DevTools (if it has one)
+    if (newWcId !== null && newWcId !== 0) {
+      const next = devToolsState.get(newWcId);
+      if (next) {
+        if (!next.attached) {
+          next.attached = true;
+          try { win.contentView.addChildView(next.view); } catch {}
+        }
+        next.view.setBounds({ x: Math.round(rect.x + rect.w - next.devWidth), y: Math.round(rect.y), width: next.devWidth, height: Math.round(rect.h) });
+        activeDevToolsWcId.set(win.id, newWcId);
+        e.sender.send('devtools:state', true, next.devWidth);
+        return;
+      }
+    }
+
+    activeDevToolsWcId.delete(win.id);
+    e.sender.send('devtools:state', false, 0);
   });
 
   // Renderer tells us its new devWidth (from drag) or asks for resize
   ipcMain.on('devtools:resize', (e, rect: { x: number; y: number; w: number; h: number }, newDevWidth?: number) => {
     const win = BrowserWindow.fromWebContents(e.sender);
     if (!win) return;
-    const state = devToolsState.get(win.id);
+    const activeWcId = activeDevToolsWcId.get(win.id);
+    if (activeWcId === undefined) return;
+    const state = devToolsState.get(activeWcId);
     if (!state) return;
     const devWidth = newDevWidth || state.devWidth;
     state.devWidth = devWidth;
@@ -494,7 +553,20 @@ function setupIPC() {
 
   ipcMain.on('devtools:close', (e) => {
     const win = BrowserWindow.fromWebContents(e.sender);
-    if (win) closeDevToolsForWindow(win);
+    if (!win) return;
+    const activeWcId = activeDevToolsWcId.get(win.id);
+    if (activeWcId === undefined) return;
+    destroyDevToolsForWcId(activeWcId);
+    try { win.webContents.send('devtools:state', false, 0); } catch {}
+  });
+
+  // Called when a tab is closed — destroy that tab's DevTools regardless of active state
+  ipcMain.on('devtools:closeTab', (e, wcId: number) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+    const wasActive = activeDevToolsWcId.get(win.id) === wcId;
+    destroyDevToolsForWcId(wcId);
+    if (wasActive) try { win.webContents.send('devtools:state', false, 0); } catch {}
   });
 
 

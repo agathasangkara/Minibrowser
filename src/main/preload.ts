@@ -92,6 +92,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // DevTools
   openDevTools: (wcId: number, rect: any) => ipcRenderer.send('devtools:open', wcId, rect),
+  switchDevToolsTab: (oldWcId: number | null, newWcId: number | null, rect: any) => ipcRenderer.send('devtools:switch', oldWcId, newWcId, rect),
+  closeDevToolsForTab: (wcId: number) => ipcRenderer.send('devtools:closeTab', wcId),
   resizeDevTools: (rect: any, devWidth?: number) => ipcRenderer.send('devtools:resize', rect, devWidth),
   closeDevTools: () => ipcRenderer.send('devtools:close'),
   onDevToolsState: (cb: any) => {

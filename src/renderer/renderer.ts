@@ -10,6 +10,8 @@ interface Tab {
   loading: boolean;
   favicon: string;
   muted: boolean;
+  devToolsOpen: boolean;
+  devToolsWidth: number;
 }
 
 let tabs: Tab[] = [];
@@ -398,7 +400,7 @@ function doRender(obj){
 
 let dragTabId: number | null = null;
 
-function createTab(url?: string) {
+function createTab(url?: string, noMirror?: boolean) {
   const id = ++tabIdCounter;
   const tabEl = document.createElement('div');
   tabEl.className = 'tab';
@@ -449,7 +451,7 @@ function createTab(url?: string) {
   const initialUrl = url ? normalizeUrl(url) : getHomepageUrl(cachedBookmarks);
   $webviewContainer.appendChild(webview);
   webview.src = initialUrl;
-  const tab: Tab = { id, el: tabEl, webview, title: 'New Tab', url: initialUrl, loading: false, favicon: '', muted: false };
+  const tab: Tab = { id, el: tabEl, webview, title: 'New Tab', url: initialUrl, loading: false, favicon: '', muted: false, devToolsOpen: false, devToolsWidth: 0 };
 
   // Set default browser icon for homepage tabs
   if (!url || isHomepageUrl(initialUrl)) {
@@ -533,9 +535,10 @@ function createTab(url?: string) {
 
   tabs.push(tab);
   $tabsContainer.appendChild(tabEl);
-  switchTab(id);
+  switchTab(id, true); // noMirror=true: newTab event already covers this switch
   // Auto-focus URL bar on new blank tab so user can type immediately
   if (!url) { setTimeout(() => { $urlBar.focus(); $urlBar.select(); }, 50); }
+  if (!noMirror) sendChromeMirror('newTab', { url: isHomepageUrl(initialUrl) ? null : initialUrl });
 }
 
 function updateTabTitle(tab: Tab) {
@@ -547,11 +550,18 @@ function updateTabTitle(tab: Tab) {
   }
 }
 
-function switchTab(id: number) {
+function switchTab(id: number, noMirror?: boolean) {
   const tab = tabs.find((t) => t.id === id);
   if (!tab) return;
-  // Close embedded DevTools when switching tabs
-  if (devToolsOpen && api) { api.closeDevTools(); }
+
+  // Tell main process to hide old tab's DevTools view and show new tab's (no destroy)
+  if (api) {
+    const prevTab = getActiveTab();
+    const oldWcId = (prevTab && prevTab.id !== id) ? (() => { try { return prevTab.webview.getWebContentsId(); } catch { return null; } })() : null;
+    const newWcId = (() => { try { return tab.webview.getWebContentsId(); } catch { return null; } })();
+    api.switchDevToolsTab(oldWcId, newWcId, getContainerRect());
+  }
+
   activeTabId = id;
   tabs.forEach((t) => {
     t.el.classList.toggle('active', t.id === id);
@@ -566,17 +576,25 @@ function switchTab(id: number) {
   try { currentZoom = tab.webview.getZoomFactor(); } catch (_) { currentZoom = 1.0; }
   $zoomLevel.textContent = Math.round(currentZoom * 100) + '%';
   $toggleSound.checked = !tab.muted;
+  if (!noMirror) sendChromeMirror('switchTab', { index: tabs.findIndex((t) => t.id === id) });
 }
 
 function closeTab(id: number) {
   const idx = tabs.findIndex((t) => t.id === id);
   if (idx === -1) return;
+  const tab = tabs[idx];
+  // Destroy this tab's DevTools before removing the webview
+  if (api) { try { const wcId = tab.webview.getWebContentsId(); if (wcId) api.closeDevToolsForTab(wcId); } catch {} }
   if (tabs.length === 1) {
-    const old = tabs[0]; old.el.remove(); old.webview.remove(); tabs.splice(0, 1);
-    activeTabId = -1; createTab(); return;
+    tab.el.remove(); tab.webview.remove(); tabs.splice(0, 1);
+    sendChromeMirror('closeTab');
+    activeTabId = -1; createTab(undefined, true); return; // noMirror=true: target handles its own replacement
   }
-  const tab = tabs[idx]; tab.el.remove(); tab.webview.remove(); tabs.splice(idx, 1);
-  if (activeTabId === id) { const nextIdx = Math.min(idx, tabs.length - 1); switchTab(tabs[nextIdx].id); }
+  tab.el.remove(); tab.webview.remove(); tabs.splice(idx, 1);
+  if (activeTabId === id) {
+    sendChromeMirror('closeTab');
+    const nextIdx = Math.min(idx, tabs.length - 1); switchTab(tabs[nextIdx].id, true); // noMirror=true: closeTab event covers this
+  }
 }
 
 function getActiveTab(): Tab | undefined { return tabs.find((t) => t.id === activeTabId); }
@@ -641,9 +659,12 @@ function getContainerRect(): { x: number; y: number; w: number; h: number } {
   return { x: Math.round($webviewContainer.getBoundingClientRect().x), y: Math.round($webviewContainer.getBoundingClientRect().y), w: Math.round(parent.width), h: Math.round($webviewContainer.getBoundingClientRect().height) };
 }
 
+let lastDevToolsToggle = 0;
 function toggleDevTools(webview: any) {
+  const now = Date.now();
+  if (now - lastDevToolsToggle < 200) return; // debounce double-fire from document + webview shortcut
+  lastDevToolsToggle = now;
   if (!api || !webview) return;
-  if (isHomepageUrl(webview.src || '')) return;
   api.openDevTools(webview.getWebContentsId(), getContainerRect());
 }
 
@@ -662,6 +683,8 @@ function hideDevToolsDivider() {
 if (api) {
   api.onDevToolsState((open: boolean, dw: number) => {
     devToolsOpen = open;
+    const activeTab = getActiveTab();
+    if (activeTab) { activeTab.devToolsOpen = open; activeTab.devToolsWidth = dw; }
     if (open) {
       devToolsWidth = dw;
       $webviewContainer.style.marginRight = dw + 'px';
@@ -1298,6 +1321,19 @@ async function showMirrorDropdown() {
   dd.className = 'mirror-dropdown';
   dd.innerHTML = '<div class="mirror-dd-title">Mirror to:</div>';
 
+  // Select All row
+  const selectAllRow = document.createElement('label');
+  selectAllRow.className = 'mirror-dd-item';
+  selectAllRow.style.cssText = 'border-bottom:1px solid var(--border);margin-bottom:2px;padding-bottom:8px;font-weight:500';
+  const selectAllCb = document.createElement('input');
+  selectAllCb.type = 'checkbox';
+  const selectAllLabel = document.createElement('span');
+  selectAllLabel.textContent = 'Select All';
+  selectAllRow.appendChild(selectAllCb);
+  selectAllRow.appendChild(selectAllLabel);
+  dd.appendChild(selectAllRow);
+
+  // Individual target rows
   targets.forEach((t: { windowId: number; profile: string }) => {
     const row = document.createElement('label');
     row.className = 'mirror-dd-item';
@@ -1306,37 +1342,86 @@ async function showMirrorDropdown() {
     dd.appendChild(row);
   });
 
+  // Sync Select All state
+  function updateSelectAll() {
+    const cbs = Array.from(dd.querySelectorAll('.mirror-cb')) as HTMLInputElement[];
+    const n = cbs.filter((c) => c.checked).length;
+    selectAllCb.checked = n === cbs.length;
+    selectAllCb.indeterminate = n > 0 && n < cbs.length;
+  }
+  updateSelectAll();
+  selectAllCb.addEventListener('change', () => {
+    dd.querySelectorAll('.mirror-cb').forEach((cb: any) => { cb.checked = selectAllCb.checked; });
+  });
+  dd.querySelectorAll('.mirror-cb').forEach((cb: any) => { cb.addEventListener('change', updateSelectAll); });
+
+  function getCheckedIds(): number[] {
+    const ids: number[] = [];
+    dd.querySelectorAll('.mirror-cb:checked').forEach((cb: any) => { ids.push(parseInt(cb.dataset.wid)); });
+    return ids;
+  }
+
+  function stopMirror() {
+    mirrorActive = false;
+    mirrorTargetIds = [];
+    tabs.forEach((t) => { t.webview.executeJavaScript('window.__mirrorActive=false;').catch(() => {}); });
+    showToast('Mirror off');
+    updateMirrorButton();
+    closeMirrorDropdown();
+  }
+
   const btnRow = document.createElement('div');
   btnRow.className = 'mirror-dd-actions';
-  btnRow.innerHTML = '<button class="btn-primary" id="mirror-dd-start" style="height:26px;padding:0 12px;font-size:11px;flex:1">' + (mirrorActive ? 'Stop' : 'Start') + '</button>';
-  dd.appendChild(btnRow);
 
+  if (mirrorActive) {
+    // When ON: Stop All + Apply (to update target list or partially stop)
+    const btnStopAll = document.createElement('button');
+    btnStopAll.className = 'btn-secondary';
+    btnStopAll.textContent = 'Stop All';
+    btnStopAll.style.cssText = 'height:26px;padding:0 10px;font-size:11px;flex:1';
+    btnStopAll.addEventListener('click', stopMirror);
+
+    const btnApply = document.createElement('button');
+    btnApply.className = 'btn-primary';
+    btnApply.textContent = 'Apply';
+    btnApply.style.cssText = 'height:26px;padding:0 10px;font-size:11px;flex:1';
+    btnApply.addEventListener('click', () => {
+      const ids = getCheckedIds();
+      if (ids.length === 0) { stopMirror(); return; }
+      mirrorTargetIds = ids;
+      showToast('Mirror updated');
+      updateMirrorButton();
+      closeMirrorDropdown();
+    });
+
+    btnRow.appendChild(btnStopAll);
+    btnRow.appendChild(btnApply);
+  } else {
+    // When OFF: Start
+    const btnStart = document.createElement('button');
+    btnStart.className = 'btn-primary';
+    btnStart.textContent = 'Start';
+    btnStart.style.cssText = 'height:26px;padding:0 12px;font-size:11px;flex:1';
+    btnStart.addEventListener('click', () => {
+      const ids = getCheckedIds();
+      if (ids.length === 0) { showToast('Select at least one profile'); return; }
+      mirrorTargetIds = ids;
+      mirrorActive = true;
+      if (api) api.activateMirror();
+      tabs.forEach((t) => { t.webview.executeJavaScript(MIRROR_CAPTURE_SCRIPT).catch(() => {}); });
+      showToast('Mirror on');
+      updateMirrorButton();
+      closeMirrorDropdown();
+    });
+    btnRow.appendChild(btnStart);
+  }
+
+  dd.appendChild(btnRow);
   document.body.appendChild(dd);
 
   const rect = $btnMirror.getBoundingClientRect();
   dd.style.top = (rect.bottom + 4) + 'px';
   dd.style.right = (window.innerWidth - rect.right) + 'px';
-
-  document.getElementById('mirror-dd-start')!.addEventListener('click', () => {
-    const checked: number[] = [];
-    dd.querySelectorAll('.mirror-cb:checked').forEach((cb: any) => { checked.push(parseInt(cb.dataset.wid)); });
-
-    if (!mirrorActive) {
-      if (checked.length === 0) { showToast('Select at least one profile'); return; }
-      mirrorTargetIds = checked;
-      mirrorActive = true;
-      if (api) api.activateMirror();
-      tabs.forEach((t) => { t.webview.executeJavaScript(MIRROR_CAPTURE_SCRIPT).catch(() => {}); });
-      showToast('Mirror on');
-    } else {
-      mirrorActive = false;
-      mirrorTargetIds = [];
-      tabs.forEach((t) => { t.webview.executeJavaScript('window.__mirrorActive=false;').catch(() => {}); });
-      showToast('Mirror off');
-    }
-    updateMirrorButton();
-    closeMirrorDropdown();
-  });
 
   setTimeout(() => {
     document.addEventListener('click', function handler(e: Event) {
@@ -1350,18 +1435,8 @@ async function showMirrorDropdown() {
 
 $btnMirror.addEventListener('click', (e: Event) => {
   e.stopPropagation();
-  if (mirrorActive) {
-    // If already active, just stop
-    mirrorActive = false;
-    mirrorTargetIds = [];
-    updateMirrorButton();
-    tabs.forEach((t) => { t.webview.executeJavaScript('window.__mirrorActive=false;').catch(() => {}); });
-    showToast('Mirror off');
-    closeMirrorDropdown();
-  } else {
-    if (mirrorDropdownOpen) closeMirrorDropdown();
-    else showMirrorDropdown();
-  }
+  if (mirrorDropdownOpen) closeMirrorDropdown();
+  else showMirrorDropdown();
 });
 updateMirrorButton();
 
@@ -1452,6 +1527,9 @@ if (api) {
           case 'navigate': tab.url = ev.url; tab.webview.src = ev.url; $urlBar.value = ev.url; break;
           case 'urlFocus': $urlBar.focus(); break;
           case 'urlInput': $urlBar.value = ev.value || ''; break;
+          case 'newTab': createTab(ev.url || undefined, true); break;
+          case 'closeTab': if (activeTabId !== -1) closeTab(activeTabId); break;
+          case 'switchTab': { const t = tabs[ev.index]; if (t) switchTab(t.id, true); } break;
         }
       } else {
         const tab = getActiveTab();
